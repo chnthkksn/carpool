@@ -1,8 +1,16 @@
-import { ObjectId } from "mongodb";
+import { Collection, ObjectId } from "mongodb";
 
 import { resolveCityByName, type GeoLocation } from "@/lib/geocoding";
 import { haversineDistanceKm, interpolatePath, projectPointOnPolyline, type LatLng } from "@/lib/geo";
 import { getDb } from "@/lib/mongodb";
+import {
+  computeRouteBounds,
+  corridorKmToDegreeBuffers,
+  decodePolyline,
+  encodePolyline,
+  simplifyPolyline,
+  type RouteBounds,
+} from "@/lib/route-compression";
 import { buildRoutePolyline } from "@/lib/routing";
 
 export type Ride = {
@@ -29,15 +37,27 @@ type RideDocument = {
   to?: string;
   fromPoint?: LatLng;
   toPoint?: LatLng;
-  routePoints?: LatLng[];
   departureAtIso?: string;
-  dateLabel?: string;
-  timeLabel?: string;
   priceLkr?: number;
   seatsLeft?: number;
   driverName?: string;
   driverRating?: number;
   routeDistanceKm?: number;
+  routeMinLat?: number;
+  routeMaxLat?: number;
+  routeMinLng?: number;
+  routeMaxLng?: number;
+  routePoints?: LatLng[];
+};
+
+type RideRouteDocument = {
+  _id?: ObjectId;
+  rideId: ObjectId;
+  routePolyline?: string;
+  routePoints?: LatLng[];
+  routeDistanceKm: number;
+  pointCount?: number;
+  updatedAt: string;
 };
 
 export type CreateRideInput = {
@@ -59,6 +79,14 @@ export type CreateRideInput = {
   driverName: string;
   driverRating?: number;
   waypoints?: string[];
+};
+
+type BuiltRoutePayload = {
+  ride: RideDocument;
+  compressedPoints: LatLng[];
+  encodedPolyline: string;
+  routeDistanceKm: number;
+  bounds: RouteBounds;
 };
 
 const seedInput: CreateRideInput[] = [
@@ -102,47 +130,60 @@ const seedInput: CreateRideInput[] = [
   },
 ];
 
-function normalizeRideDocument(document: RideDocument): Required<Omit<RideDocument, "_id">> {
-  const fromFallback = document.from ?? "Unknown";
-  const toFallback = document.to ?? "Unknown";
+function routeDistance(points: LatLng[]): number {
+  if (points.length < 2) {
+    return 0;
+  }
 
-  const fromPoint =
-    document.fromPoint ??
-    { lat: 0, lng: 0 };
+  let sum = 0;
 
-  const toPoint =
-    document.toPoint ??
-    { lat: 0, lng: 0 };
+  for (let i = 1; i < points.length; i += 1) {
+    const prev = points[i - 1];
+    const curr = points[i];
 
-  const routePoints =
-    document.routePoints && document.routePoints.length > 1
-      ? document.routePoints
-      : interpolatePath(fromPoint, toPoint, 18);
+    if (!prev || !curr) {
+      continue;
+    }
 
-  const routeDistanceKm =
-    typeof document.routeDistanceKm === "number"
-      ? document.routeDistanceKm
-      : routeDistance(routePoints);
+    sum += haversineDistanceKm(prev, curr);
+  }
 
+  return sum;
+}
+
+function boundsFromPoints(points: LatLng[]): RouteBounds {
+  if (points.length < 2) {
+    return { minLat: 0, maxLat: 0, minLng: 0, maxLng: 0 };
+  }
+
+  return computeRouteBounds(points);
+}
+
+function normalizeRideDocument(document: RideDocument): Required<Omit<RideDocument, "_id" | "routePoints">> {
+  const from = document.from ?? "Unknown";
+  const to = document.to ?? "Unknown";
+  const fromPoint = document.fromPoint ?? { lat: 0, lng: 0 };
+  const toPoint = document.toPoint ?? { lat: 0, lng: 0 };
   const departureAtIso =
     document.departureAtIso && !Number.isNaN(new Date(document.departureAtIso).getTime())
       ? document.departureAtIso
       : new Date().toISOString();
 
   return {
-    from: fromFallback,
-    to: toFallback,
+    from,
+    to,
     fromPoint,
     toPoint,
-    routePoints,
     departureAtIso,
-    dateLabel: document.dateLabel ?? "",
-    timeLabel: document.timeLabel ?? "",
     priceLkr: document.priceLkr ?? 0,
     seatsLeft: document.seatsLeft ?? 1,
     driverName: document.driverName ?? "Driver",
     driverRating: document.driverRating ?? 4.5,
-    routeDistanceKm,
+    routeDistanceKm: typeof document.routeDistanceKm === "number" ? document.routeDistanceKm : 0,
+    routeMinLat: typeof document.routeMinLat === "number" ? document.routeMinLat : Math.min(fromPoint.lat, toPoint.lat),
+    routeMaxLat: typeof document.routeMaxLat === "number" ? document.routeMaxLat : Math.max(fromPoint.lat, toPoint.lat),
+    routeMinLng: typeof document.routeMinLng === "number" ? document.routeMinLng : Math.min(fromPoint.lng, toPoint.lng),
+    routeMaxLng: typeof document.routeMaxLng === "number" ? document.routeMaxLng : Math.max(fromPoint.lng, toPoint.lng),
   };
 }
 
@@ -173,28 +214,22 @@ function toRide(document: RideDocument, match?: Ride["match"]): Ride {
   };
 }
 
-function routeDistance(points: LatLng[]): number {
-  if (points.length < 2) {
-    return 0;
-  }
+async function ensureCollections() {
+  const db = await getDb();
+  const ridesCollection = db.collection<RideDocument>("rides");
+  const routesCollection = db.collection<RideRouteDocument>("ride_routes");
 
-  let sum = 0;
+  await Promise.all([
+    ridesCollection.createIndex({ departureAtIso: 1 }),
+    ridesCollection.createIndex({ seatsLeft: 1 }),
+    ridesCollection.createIndex({ routeMinLat: 1, routeMaxLat: 1, routeMinLng: 1, routeMaxLng: 1 }),
+    routesCollection.createIndex({ rideId: 1 }, { unique: true }),
+  ]);
 
-  for (let i = 1; i < points.length; i += 1) {
-    const prev = points[i - 1];
-    const curr = points[i];
-
-    if (!prev || !curr) {
-      continue;
-    }
-
-    sum += haversineDistanceKm(prev, curr);
-  }
-
-  return sum;
+  return { ridesCollection, routesCollection };
 }
 
-async function buildRideDocument(input: CreateRideInput): Promise<RideDocument> {
+async function buildRidePayload(input: CreateRideInput): Promise<BuiltRoutePayload> {
   const [resolvedFrom, resolvedTo] = await Promise.all([
     input.fromLocation
       ? Promise.resolve<GeoLocation>({
@@ -218,11 +253,10 @@ async function buildRideDocument(input: CreateRideInput): Promise<RideDocument> 
     throw new Error("Could not resolve departure or destination city.");
   }
 
-  const waypointCities = await Promise.all((input.waypoints ?? []).map((name) => resolveCityByName(name)));
-
-  const waypointPoints = waypointCities
-    .filter((city): city is NonNullable<typeof city> => city !== null)
-    .map((city) => ({ lat: city.lat, lng: city.lng }));
+  const waypointLocations = await Promise.all((input.waypoints ?? []).map((name) => resolveCityByName(name)));
+  const waypointPoints = waypointLocations
+    .filter((location): location is NonNullable<typeof location> => location !== null)
+    .map((location) => ({ lat: location.lat, lng: location.lng }));
 
   const pathPoints: LatLng[] = [
     { lat: resolvedFrom.lat, lng: resolvedFrom.lng },
@@ -230,54 +264,158 @@ async function buildRideDocument(input: CreateRideInput): Promise<RideDocument> 
     { lat: resolvedTo.lat, lng: resolvedTo.lng },
   ];
 
-  const polyline = await buildRoutePolyline(pathPoints);
+  const rawRoutePoints = await buildRoutePolyline(pathPoints);
+  const compressedPoints = simplifyPolyline(rawRoutePoints, 0.1, 220);
+  const encodedPolyline = encodePolyline(compressedPoints);
+  const distanceKm = routeDistance(compressedPoints);
+  const bounds = boundsFromPoints(compressedPoints);
 
   return {
-    from: resolvedFrom.name,
-    to: resolvedTo.name,
-    fromPoint: { lat: resolvedFrom.lat, lng: resolvedFrom.lng },
-    toPoint: { lat: resolvedTo.lat, lng: resolvedTo.lng },
-    routePoints: polyline,
-    departureAtIso: input.departureAtIso,
-    priceLkr: input.priceLkr,
-    seatsLeft: input.seatsLeft,
-    driverName: input.driverName,
-    driverRating: input.driverRating ?? 4.6,
-    routeDistanceKm: routeDistance(polyline),
+    ride: {
+      from: resolvedFrom.name,
+      to: resolvedTo.name,
+      fromPoint: { lat: resolvedFrom.lat, lng: resolvedFrom.lng },
+      toPoint: { lat: resolvedTo.lat, lng: resolvedTo.lng },
+      departureAtIso: input.departureAtIso,
+      priceLkr: input.priceLkr,
+      seatsLeft: input.seatsLeft,
+      driverName: input.driverName,
+      driverRating: input.driverRating ?? 4.6,
+      routeDistanceKm: distanceKm,
+      routeMinLat: bounds.minLat,
+      routeMaxLat: bounds.maxLat,
+      routeMinLng: bounds.minLng,
+      routeMaxLng: bounds.maxLng,
+    },
+    compressedPoints,
+    encodedPolyline,
+    routeDistanceKm: distanceKm,
+    bounds,
   };
 }
 
-async function ensureSeedRides(): Promise<void> {
-  const database = await getDb();
-  const ridesCollection = database.collection<RideDocument>("rides");
+async function upsertRouteForRide(
+  routesCollection: Collection<RideRouteDocument>,
+  rideId: ObjectId,
+  routePolyline: string,
+  routeDistanceKm: number,
+  pointCount: number
+) {
+  await routesCollection.updateOne(
+    { rideId },
+    {
+      $set: {
+        rideId,
+        routePolyline,
+        routeDistanceKm,
+        pointCount,
+        updatedAt: new Date().toISOString(),
+      },
+      $unset: {
+        routePoints: "",
+      },
+    },
+    { upsert: true }
+  );
+}
 
+function toFallbackRoutePoints(ride: RideDocument): LatLng[] {
+  if (ride.routePoints && ride.routePoints.length > 1) {
+    return ride.routePoints;
+  }
+
+  const normalized = normalizeRideDocument(ride);
+  return interpolatePath(normalized.fromPoint, normalized.toPoint, 18);
+}
+
+async function resolveRoutePointsForRide(
+  ridesCollection: Collection<RideDocument>,
+  routesCollection: Collection<RideRouteDocument>,
+  ride: RideDocument
+): Promise<LatLng[]> {
+  const rideId = ride._id;
+
+  if (!rideId) {
+    return toFallbackRoutePoints(ride);
+  }
+
+  const routeDoc = await routesCollection.findOne({ rideId });
+
+  if (routeDoc?.routePolyline) {
+    const decoded = decodePolyline(routeDoc.routePolyline);
+    if (decoded.length > 1) {
+      return decoded;
+    }
+  }
+
+  const legacyRoutePoints =
+    routeDoc?.routePoints && routeDoc.routePoints.length > 1 ? routeDoc.routePoints : toFallbackRoutePoints(ride);
+
+  const compressedPoints = simplifyPolyline(legacyRoutePoints, 0.1, 220);
+  const routePolyline = encodePolyline(compressedPoints);
+  const distanceKm = routeDistance(compressedPoints);
+  const bounds = boundsFromPoints(compressedPoints);
+
+  await Promise.all([
+    upsertRouteForRide(routesCollection, rideId, routePolyline, distanceKm, compressedPoints.length),
+    ridesCollection.updateOne(
+      { _id: rideId },
+      {
+        $set: {
+          ...normalizeRideDocument(ride),
+          routeDistanceKm: distanceKm,
+          routeMinLat: bounds.minLat,
+          routeMaxLat: bounds.maxLat,
+          routeMinLng: bounds.minLng,
+          routeMaxLng: bounds.maxLng,
+        },
+        $unset: {
+          routePoints: "",
+        },
+      }
+    ),
+  ]);
+
+  return compressedPoints;
+}
+
+async function ensureSeedRides(): Promise<void> {
+  const { ridesCollection, routesCollection } = await ensureCollections();
   const count = await ridesCollection.countDocuments();
 
   if (count > 0) {
     return;
   }
 
-  const seedDocs: RideDocument[] = [];
+  for (const input of seedInput) {
+    const payload = await buildRidePayload(input);
+    const insertResult = await ridesCollection.insertOne(payload.ride);
 
-  for (const ride of seedInput) {
-    const doc = await buildRideDocument(ride);
-    seedDocs.push(doc);
-  }
-
-  if (seedDocs.length > 0) {
-    await ridesCollection.insertMany(seedDocs);
+    await upsertRouteForRide(
+      routesCollection,
+      insertResult.insertedId,
+      payload.encodedPolyline,
+      payload.routeDistanceKm,
+      payload.compressedPoints.length
+    );
   }
 }
 
 export async function createRide(input: CreateRideInput): Promise<Ride> {
-  const database = await getDb();
-  const ridesCollection = database.collection<RideDocument>("rides");
+  const { ridesCollection, routesCollection } = await ensureCollections();
+  const payload = await buildRidePayload(input);
+  const insertResult = await ridesCollection.insertOne(payload.ride);
 
-  const document = await buildRideDocument(input);
-  const insertResult = await ridesCollection.insertOne(document);
+  await upsertRouteForRide(
+    routesCollection,
+    insertResult.insertedId,
+    payload.encodedPolyline,
+    payload.routeDistanceKm,
+    payload.compressedPoints.length
+  );
 
   return toRide({
-    ...document,
+    ...payload.ride,
     _id: insertResult.insertedId,
   });
 }
@@ -285,39 +423,22 @@ export async function createRide(input: CreateRideInput): Promise<Ride> {
 export async function listRides(limit = 12): Promise<Ride[]> {
   await ensureSeedRides();
 
-  const database = await getDb();
-  const ridesCollection = database.collection<RideDocument>("rides");
+  const { ridesCollection } = await ensureCollections();
 
-  const rides = await ridesCollection.find().sort({ departureAtIso: 1 }).limit(limit).toArray();
-
-  const hydrated = await Promise.all(
-    rides.map(async (ride) => {
-      const normalized = normalizeRideDocument(ride);
-      const needsPatch =
-        !ride.fromPoint ||
-        !ride.toPoint ||
-        !ride.routePoints ||
-        ride.routePoints.length < 2 ||
-        typeof ride.routeDistanceKm !== "number" ||
-        !ride.departureAtIso;
-
-      if (needsPatch && ride._id) {
-        await ridesCollection.updateOne(
-          { _id: ride._id },
-          {
-            $set: normalized,
-          }
-        );
+  const rides = await ridesCollection
+    .find(
+      {},
+      {
+        projection: {
+          routePoints: 0,
+        },
       }
+    )
+    .sort({ departureAtIso: 1 })
+    .limit(limit)
+    .toArray();
 
-      return {
-        ...ride,
-        ...normalized,
-      };
-    })
-  );
-
-  return hydrated.map((ride) => toRide(ride));
+  return rides.map((ride) => toRide(ride));
 }
 
 export async function findRidesByRoute(
@@ -328,26 +449,62 @@ export async function findRidesByRoute(
 ): Promise<Ride[]> {
   await ensureSeedRides();
 
-  const database = await getDb();
-  const ridesCollection = database.collection<RideDocument>("rides");
+  const { ridesCollection, routesCollection } = await ensureCollections();
 
-  const rides = await ridesCollection.find().sort({ departureAtIso: 1 }).limit(limit).toArray();
+  const minLat = Math.min(pickup.lat, drop.lat);
+  const maxLat = Math.max(pickup.lat, drop.lat);
+  const minLng = Math.min(pickup.lng, drop.lng);
+  const maxLng = Math.max(pickup.lng, drop.lng);
+
+  const refLat = (pickup.lat + drop.lat) / 2;
+  const { latBuffer, lngBuffer } = corridorKmToDegreeBuffers(corridorKm, refLat);
+
+  const candidateRides = await ridesCollection
+    .find(
+      {
+        seatsLeft: { $gt: 0 },
+        $or: [
+          {
+            routeMinLat: { $lte: minLat + latBuffer },
+            routeMaxLat: { $gte: maxLat - latBuffer },
+            routeMinLng: { $lte: minLng + lngBuffer },
+            routeMaxLng: { $gte: maxLng - lngBuffer },
+          },
+          {
+            routeMinLat: { $exists: false },
+          },
+        ],
+      },
+      {
+        projection: {
+          routePoints: 0,
+        },
+      }
+    )
+    .sort({ departureAtIso: 1 })
+    .limit(Math.max(limit * 4, limit))
+    .toArray();
 
   const matches: Ride[] = [];
 
-  for (const ride of rides) {
+  for (const ride of candidateRides) {
     const normalized = normalizeRideDocument(ride);
 
-    if (!normalized.routePoints || normalized.routePoints.length < 2 || normalized.seatsLeft <= 0) {
+    if (normalized.seatsLeft <= 0) {
       continue;
     }
 
-    const pickupProjection = projectPointOnPolyline(pickup, normalized.routePoints);
-    const dropProjection = projectPointOnPolyline(drop, normalized.routePoints);
+    const routePoints = await resolveRoutePointsForRide(ridesCollection, routesCollection, ride);
+
+    if (routePoints.length < 2) {
+      continue;
+    }
+
+    const pickupProjection = projectPointOnPolyline(pickup, routePoints);
+    const dropProjection = projectPointOnPolyline(drop, routePoints);
 
     const isWithinCorridor =
       pickupProjection.closestDistanceKm <= corridorKm && dropProjection.closestDistanceKm <= corridorKm;
-
     const inOrder = pickupProjection.alongDistanceKm < dropProjection.alongDistanceKm;
 
     if (!isWithinCorridor || !inOrder) {
@@ -361,11 +518,15 @@ export async function findRidesByRoute(
           ...normalized,
         },
         {
-        pickupDistanceKm: Number(pickupProjection.closestDistanceKm.toFixed(2)),
-        dropDistanceKm: Number(dropProjection.closestDistanceKm.toFixed(2)),
+          pickupDistanceKm: Number(pickupProjection.closestDistanceKm.toFixed(2)),
+          dropDistanceKm: Number(dropProjection.closestDistanceKm.toFixed(2)),
         }
       )
     );
+
+    if (matches.length >= limit) {
+      break;
+    }
   }
 
   return matches;
