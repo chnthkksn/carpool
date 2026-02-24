@@ -1,6 +1,8 @@
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "better-auth/adapters/mongodb";
 import { nextCookies } from "better-auth/next-js";
+import { twoFactor } from "better-auth/plugins";
+import { passkey } from "@better-auth/passkey";
 
 import { db } from "@/lib/mongodb";
 
@@ -10,7 +12,8 @@ const appUrl =
   "http://localhost:3000";
 
 const authSecret =
-  process.env.BETTER_AUTH_SECRET ?? "development-secret-change-in-production-12345";
+  process.env.BETTER_AUTH_SECRET ??
+  "development-secret-change-in-production-12345";
 
 export const auth = betterAuth({
   database: mongodbAdapter(db),
@@ -20,5 +23,5 @@ export const auth = betterAuth({
   secret: authSecret,
   baseURL: appUrl,
   trustedOrigins: [appUrl],
-  plugins: [nextCookies()],
+  plugins: [nextCookies(), twoFactor(), passkey()],
 });
